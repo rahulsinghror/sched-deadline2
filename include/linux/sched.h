@@ -39,6 +39,7 @@
 #define SCHED_BATCH		3
 /* SCHED_ISO: reserved but not implemented yet */
 #define SCHED_IDLE		5
+#define SCHED_DEADLINE		6
 /* Can be ORed in to make sure the process is reverted back to SCHED_NORMAL on fork */
 #define SCHED_RESET_ON_FORK     0x40000000
 
@@ -93,6 +94,104 @@ struct sched_param {
 #include <linux/llist.h>
 
 #include <asm/processor.h>
+
+/*
+ * Extended scheduling parameters data structure.
+ *
+ * This is needed because the original struct sched_param can not be
+ * altered without introducing ABI issues with legacy applications
+ * (e.g., in sched_getparam()).
+ *
+ * However, the possibility of specifying more than just a priority for
+ * the tasks may be useful for a wide variety of application fields, e.g.,
+ * multimedia, streaming, automation and control, and many others.
+ *
+ * This variant (sched_param_ex) is meant at describing a so-called
+ * sporadic time-constrained task. In such model a task is specified by:
+ *  - the activation period or minimum instance inter-arrival time;
+ *  - the maximum (or average, depending on the actual scheduling
+ *    discipline) computation time of all instances, a.k.a. runtime;
+ *  - the deadline (relative to the actual activation time) of each
+ *    instance.
+ * Very briefly, a periodic (sporadic) task asks for the execution of
+ * some specific computation --which is typically called an instance--
+ * (at most) every period. Moreover, each instance typically lasts no more
+ * than the runtime and must be completed by time instant t equal to
+ * the instance activation time + the deadline.
+ *
+ * This is reflected by the actual fields of the sched_param_ex structure:
+ *
+ *  @sched_priority     task's priority (might still be useful)
+ *  @sched_deadline     representative of the task's deadline
+ *  @sched_runtime      representative of the task's runtime
+ *  @sched_period       representative of the task's period
+ *  @sched_flags        for customizing the scheduler behaviour
+ *
+ * There are other fields, which may be useful for implementing (in
+ * user-space) advanced scheduling behaviours, e.g., feedback scheduling:
+ *
+ *  @curr_runtime       task's currently available runtime
+ *  @used_runtime       task's totally used runtime
+ *  @curr_deadline      task's current absolute deadline
+ *
+ * Given this task model, there are a multiplicity of scheduling algorithms
+ * and policies, that can be used to ensure all the tasks will make their
+ * timing constraints.
+ *
+ * As of now, the SCHED_DEADLINE policy (sched_dl scheduling class) is the
+ * only user of this new interface. More information about the algorithm
+ * available in the scheduling class file or in Documentation/.
+ */
+struct sched_param_ex {
+	int sched_priority;
+	struct timespec sched_runtime;
+	struct timespec sched_deadline;
+	struct timespec sched_period;
+	unsigned int sched_flags;
+
+	struct timespec curr_runtime;
+	struct timespec used_runtime;
+	struct timespec curr_deadline;
+};
+
+/*
+ * Scheduler flags.
+ *
+ *  @SF_HEAD    tells us that the task has to be considered one of the
+ *              maximum priority tasks in the system. This means it
+ *              always enqueued with maximum priority in the runqueue
+ *              of the highest priority scheduling class. In case it
+ *              it sched_deadline, the task also ignore runtime and
+ *              bandwidth limitations.
+ *
+ * These flags here below are meant to be used by userspace tasks to affect
+ * the scheduler behaviour and/or specifying that they want to be informed
+ * of the occurrence of some events.
+ *
+ *  @SF_SIG_RORUN       tells us the task wants to be notified whenever
+ *                      a runtime overrun occurs;
+ *  @SF_SIG_DMISS       tells us the task wants to be notified whenever
+ *                      a scheduling deadline is missed.
+ *  @SF_BWRECL_DL       tells us that the task doesn't stop when exhausting
+ *                      its runtime, and it remains a -deadline task, even
+ *                      though its deadline is postponed. This means it
+ *                      won't affect the scheduling of the other -deadline
+ *                      tasks, but if it is a CPU-hog, lower scheduling
+ *                      classes will starve!
+ *  @SF_BWRECL_RT       tells us that the task doesn't stop when exhausting
+ *                      its runtime, and it becomes a -rt task, with the
+ *                      priority specified in the sched_priority field of
+ *                      struct shced_param_ex.
+ *  @SF_BWRECL_OTH      tells us that the task doesn't stop when exhausting
+ *                      its runtime, and it becomes a normal task, with
+ *                      default priority.
+ */
+#define SF_HEAD		1
+#define SF_SIG_RORUN	2
+#define SF_SIG_DMISS	4
+#define SF_BWRECL_DL	8
+#define SF_BWRECL_RT	16
+#define SF_BWRECL_NR	32
 
 struct exec_domain;
 struct futex_pi_state;
@@ -1078,6 +1177,7 @@ struct sched_domain;
 #else
 #define ENQUEUE_WAKING		0
 #endif
+#define ENQUEUE_REPLENISH	8
 
 #define DEQUEUE_SLEEP		1
 
@@ -1088,6 +1188,9 @@ struct sched_class {
 	void (*dequeue_task) (struct rq *rq, struct task_struct *p, int flags);
 	void (*yield_task) (struct rq *rq);
 	bool (*yield_to_task) (struct rq *rq, struct task_struct *p, bool preempt);
+
+	long (*wait_interval) (struct task_struct *p, struct timespec *rqtp,
+			       struct timespec __user *rmtp);
 
 	void (*check_preempt_curr) (struct rq *rq, struct task_struct *p, int flags);
 
@@ -1112,6 +1215,7 @@ struct sched_class {
 	void (*set_curr_task) (struct rq *rq);
 	void (*task_tick) (struct rq *rq, struct task_struct *p, int queued);
 	void (*task_fork) (struct task_struct *p);
+	void (*task_dead) (struct task_struct *p);
 
 	void (*switched_from) (struct rq *this_rq, struct task_struct *task);
 	void (*switched_to) (struct rq *this_rq, struct task_struct *task);
@@ -1208,6 +1312,62 @@ struct sched_rt_entity {
 #endif
 };
 
+struct sched_stats_dl {
+	int			dmiss, rorun;
+	u64			last_dmiss;
+	u64			last_rorun;
+#ifdef CONFIG_SCHEDSTATS
+	u64			dmiss_max;
+	u64			rorun_max;
+#endif
+	u64			tot_rtime;
+};
+
+struct sched_dl_entity {
+	struct rb_node	rb_node;
+	int nr_cpus_allowed;
+
+	/*
+	 * Original scheduling parameters. Copied here from sched_param_ex
+	 * during sched_setscheduler_ex(), they will remain the same until
+	 * the next sched_setscheduler_ex().
+	 */
+	u64 dl_runtime;		/* maximum runtime for each instance 	*/
+	u64 dl_deadline;	/* relative deadline of each instance	*/
+	u64 dl_period;		/* separation of two instances (period) */
+	u64 dl_bw;		/* dl_runtime / dl_deadline		*/
+
+	/*
+	 * Actual scheduling parameters. Initialized with the values above,
+	 * they are continously updated during task execution. Note that
+	 * the remaining runtime could be < 0 in case we are in overrun.
+	 */
+	s64 runtime;		/* remaining runtime for this instance	*/
+	u64 deadline;		/* absolute deadline for this instance	*/
+	unsigned int flags;	/* specifying the scheduler behaviour   */
+
+	/*
+	 * Some bool flags:
+	 *
+	 * @dl_throttled tells if we exhausted the runtime. If so, the
+	 * task has to wait for a replenishment to be performed at the
+	 * next firing of dl_timer.
+	 *
+	 * @dl_new tells if a new instance arrived. If so we must
+	 * start executing it with full runtime and reset its absolute
+	 * deadline;
+	 */
+	int dl_throttled, dl_new;
+
+	/*
+	 * Bandwidth enforcement timer. Each -deadline task has its
+	 * own bandwidth to be enforced, thus we need one timer per task.
+	 */
+	struct hrtimer dl_timer;
+
+	struct sched_stats_dl stats;
+};
+
 struct rcu_node;
 
 enum perf_event_task_context {
@@ -1235,6 +1395,7 @@ struct task_struct {
 	const struct sched_class *sched_class;
 	struct sched_entity se;
 	struct sched_rt_entity rt;
+	struct sched_dl_entity dl;
 
 #ifdef CONFIG_PREEMPT_NOTIFIERS
 	/* list of struct preempt_notifier: */
@@ -1277,6 +1438,7 @@ struct task_struct {
 #ifdef CONFIG_SMP
 	struct plist_node pushable_tasks;
 #endif
+	struct rb_node pushable_dl_tasks;
 
 	struct mm_struct *mm, *active_mm;
 #ifdef CONFIG_COMPAT_BRK
@@ -1423,6 +1585,8 @@ struct task_struct {
 	struct plist_head pi_waiters;
 	/* Deadlock detection and priority inheritance handling */
 	struct rt_mutex_waiter *pi_blocked_on;
+	/* */
+	struct task_struct *pi_top_task;
 #endif
 
 #ifdef CONFIG_DEBUG_MUTEXES
@@ -1588,6 +1752,10 @@ struct task_struct {
  * user-space.  This allows kernel threads to set their
  * priority to a value higher than any user task. Note:
  * MAX_RT_PRIO must not be smaller than MAX_USER_RT_PRIO.
+ *
+ * SCHED_DEADLINE tasks has negative priorities, reflecting
+ * the fact that any of them has higher prio than RT and
+ * NORMAL/BATCH tasks.
  */
 
 #define MAX_USER_RT_PRIO	100
@@ -1596,9 +1764,32 @@ struct task_struct {
 #define MAX_PRIO		(MAX_RT_PRIO + 40)
 #define DEFAULT_PRIO		(MAX_RT_PRIO + 20)
 
+#define MAX_DL_PRIO		0
+
+static inline int dl_prio(int prio)
+{
+	if (unlikely(prio < MAX_DL_PRIO))
+		return 1;
+	return 0;
+}
+
+static inline int dl_task(struct task_struct *p)
+{
+	return dl_prio(p->prio);
+}
+
+/*
+ * We might have temporarily dropped -deadline policy,
+ * but still be a -deadline task!
+ */
+static inline int __dl_task(struct task_struct *p)
+{
+	return dl_task(p) || p->policy == SCHED_DEADLINE;
+}
+
 static inline int rt_prio(int prio)
 {
-	if (unlikely(prio < MAX_RT_PRIO))
+	if (unlikely(prio >= MAX_DL_PRIO && prio < MAX_RT_PRIO))
 		return 1;
 	return 0;
 }
@@ -2024,6 +2215,13 @@ int sched_rt_handler(struct ctl_table *table, int write,
 		void __user *buffer, size_t *lenp,
 		loff_t *ppos);
 
+extern unsigned int sysctl_sched_dl_period;
+extern int sysctl_sched_dl_runtime;
+
+int sched_dl_handler(struct ctl_table *table, int write,
+		void __user *buffer, size_t *lenp,
+		loff_t *ppos);
+
 #ifdef CONFIG_SCHED_AUTOGROUP
 extern unsigned int sysctl_sched_autogroup_enabled;
 
@@ -2069,6 +2267,10 @@ extern int sched_setscheduler(struct task_struct *, int,
 			      const struct sched_param *);
 extern int sched_setscheduler_nocheck(struct task_struct *, int,
 				      const struct sched_param *);
+extern void setscheduler_dl_special(struct task_struct *);
+extern int sched_setscheduler_ex(struct task_struct *, int,
+				 const struct sched_param *,
+				 const struct sched_param_ex *);
 extern struct task_struct *idle_task(int cpu);
 extern struct task_struct *curr_task(int cpu);
 extern void set_curr_task(int cpu, struct task_struct *p);

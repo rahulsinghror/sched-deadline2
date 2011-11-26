@@ -852,4 +852,8 @@ ia32_sys_call_table:
 	.quad sys_setns
 	.quad compat_sys_process_vm_readv
 	.quad compat_sys_process_vm_writev
+	.quad sys_sched_setscheduler_ex
+	.quad sys_sched_setparam_ex
+	.quad sys_sched_getparam_ex
+	.quad sys_sched_wait_interval
 ia32_syscall_end:
