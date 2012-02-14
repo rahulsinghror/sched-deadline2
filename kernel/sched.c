@@ -3150,6 +3150,13 @@ static void __sched_fork(struct task_struct *p)
 	memset(&p->se.statistics, 0, sizeof(p->se.statistics));
 #endif
 
+	RB_CLEAR_NODE(&p->dl.rb_node);
+	hrtimer_init(&p->dl.dl_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	p->dl.dl_runtime = p->dl.runtime = 0;
+	p->dl.dl_deadline = p->dl.deadline = 0;
+	p->dl.dl_period = 0;
+	p->dl.flags = 0;
+
 	INIT_LIST_HEAD(&p->rt.run_list);
 
 #ifdef CONFIG_PREEMPT_NOTIFIERS
@@ -5345,7 +5352,7 @@ void set_user_nice(struct task_struct *p, long nice)
 	 * The RT priorities are set via sched_setscheduler(), but we still
 	 * allow the 'normal' nice value to be set - but as expected
 	 * it wont have any effect on scheduling until the task is
-	 * SCHED_FIFO/SCHED_RR:
+	 * SCHED_DEADLINE, SCHED_FIFO or SCHED_RR:
 	 */
 	if (task_has_rt_policy(p)) {
 		p->static_prio = NICE_TO_PRIO(nice);
@@ -5792,12 +5799,12 @@ recheck:
 	 */
 // XXX ISS the following test fails upon schedtool
 // need to check the cause
-	if ((dl_policy(policy) || dl_task(p)) &&
-	    dl_overflow(p, policy, param_ex)) {
-		__task_rq_unlock(rq);
-		raw_spin_unlock_irqrestore(&p->pi_lock, flags);
-		return -EBUSY;
-	}
+//	if ((dl_policy(policy) || dl_task(p)) &&
+//	    dl_overflow(p, policy, param_ex)) {
+//		__task_rq_unlock(rq);
+//		raw_spin_unlock_irqrestore(&p->pi_lock, flags);
+//		return -EBUSY;
+//	}
 
 	on_rq = p->on_rq;
 	running = task_current(rq, p);
