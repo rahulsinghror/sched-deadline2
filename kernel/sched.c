@@ -683,10 +683,8 @@ struct dl_rq {
 	 */
 	struct rb_root pushable_dl_tasks_root;
 	struct rb_node *pushable_dl_tasks_leftmost;
-#endif
-
-#ifdef CONFIG_DEADLINE_GROUP_SCHED
-	struct rq *rq;
+#else
+	struct dl_bw dl_bw;
 #endif
 };
 
@@ -2572,9 +2570,6 @@ void set_task_cpu(struct task_struct *p, unsigned int new_cpu)
 #endif
 
 	trace_sched_migrate_task(p, new_cpu);
-	if (unlikely(__dl_task(p)))
-		trace_sched_migrate_task_dl(p, task_rq(p)->clock,
-					    new_cpu, cpu_rq(new_cpu)->clock);
 
 	if (task_cpu(p) != new_cpu) {
 		p->se.nr_migrations++;
@@ -3189,7 +3184,7 @@ void sched_fork(struct task_struct *p)
 	 * Revert to default priority/policy on fork if requested.
 	 */
 	if (unlikely(p->sched_reset_on_fork)) {
-		if (task_has_rt_policy(p)) {
+		if (task_has_dl_policy(p) || task_has_rt_policy(p)) {
 			p->policy = SCHED_NORMAL;
 			p->static_prio = NICE_TO_PRIO(0);
 			p->rt_priority = 0;
@@ -3206,7 +3201,12 @@ void sched_fork(struct task_struct *p)
 		p->sched_reset_on_fork = 0;
 	}
 
-	if (!rt_prio(p->prio))
+	if (dl_prio(p->prio)) {
+		put_cpu();
+	}
+	else if (rt_prio(p->prio))
+		p->sched_class = &rt_sched_class;
+	else
 		p->sched_class = &fair_sched_class;
 
 	if (p->sched_class->task_fork)
@@ -3236,6 +3236,7 @@ void sched_fork(struct task_struct *p)
 #endif
 #ifdef CONFIG_SMP
 	plist_node_init(&p->pushable_tasks, MAX_PRIO);
+	RB_CLEAR_NODE(&p->pushable_dl_tasks);
 #endif
 
 	put_cpu();
@@ -3263,7 +3264,7 @@ bool __dl_overflow(struct dl_bw *dl_b, int cpus, u64 old_bw, u64 new_bw)
 /*
  * We must be sure that accepting a new task (or allowing changing the
  * parameters of an existing one) is consistent with the bandwidth
- * contraints. If yes, this function also accordingly updates the currently
+ * constraints. If yes, this function also accordingly updates the currently
  * allocated bandwidth to reflect the new situation.
  *
  * This function is called while holding p's rq->lock.
@@ -3271,11 +3272,19 @@ bool __dl_overflow(struct dl_bw *dl_b, int cpus, u64 old_bw, u64 new_bw)
 static int dl_overflow(struct task_struct *p, int policy,
 		       const struct sched_param_ex *param_ex)
 {
+#ifdef CONFIG_SMP
 	struct dl_bw *dl_b = &task_rq(p)->rd->dl_bw;
+#else
+	struct dl_bw *dl_b = &task_rq(p)->dl.dl_bw;
+#endif
 	u64 period = timespec_to_ns(&param_ex->sched_period);
 	u64 runtime = timespec_to_ns(&param_ex->sched_runtime);
 	u64 new_bw = dl_policy(policy) ? to_ratio(period, runtime) : 0;
+#ifdef CONFIG_SMP
 	int cpus = cpumask_weight(task_rq(p)->rd->span);
+#else
+	int cpus = 1;
+#endif
 	int err = -1;
 
 	if (new_bw == p->dl.dl_bw)
@@ -3471,6 +3480,9 @@ static void finish_task_switch(struct rq *rq, struct task_struct *prev)
 	if (mm)
 		mmdrop(mm);
 	if (unlikely(prev_state == TASK_DEAD)) {
+		if (prev->sched_class->task_dead)
+			prev->sched_class->task_dead(prev);
+
 		/*
 		 * Remove function-return probe instances associated with this
 		 * task and put them back on the free list.
@@ -3552,9 +3564,6 @@ context_switch(struct rq *rq, struct task_struct *prev,
 	struct mm_struct *mm, *oldmm;
 
 	prepare_task_switch(rq, prev, next);
-	trace_sched_switch(prev, next);
-	if (unlikely(__dl_task(prev) || __dl_task(next)))
-		trace_sched_switch_dl(rq->clock, prev, next);
 	mm = next->mm;
 	oldmm = prev->active_mm;
 	/*
@@ -5354,7 +5363,7 @@ void set_user_nice(struct task_struct *p, long nice)
 	 * it wont have any effect on scheduling until the task is
 	 * SCHED_DEADLINE, SCHED_FIFO or SCHED_RR:
 	 */
-	if (task_has_rt_policy(p)) {
+	if (task_has_dl_policy(p) || task_has_rt_policy(p)) {
 		p->static_prio = NICE_TO_PRIO(nice);
 		goto out_unlock;
 	}
@@ -5566,7 +5575,7 @@ __getparam_dl(struct task_struct *p, struct sched_param_ex *param_ex)
  * This function validates the new parameters of a -deadline task.
  * We ask for the deadline not being zero, and greater or equal
  * than the runtime, as well as the period of being zero or
- * not greater than deadline.
+ * greater than deadline.
  */
 static bool
 __checkparam_dl(const struct sched_param_ex *prm, bool kthread)
@@ -5767,7 +5776,7 @@ recheck:
 			return -EPERM;
 		}
 #endif
-
+#ifdef CONFIG_SMP
 		if (dl_bandwidth_enabled() && dl_policy(policy)) {
 			const struct cpumask *span = rq->rd->span;
 
@@ -5783,6 +5792,7 @@ recheck:
 				return -EPERM;
 			}
 		}
+#endif
 	}
 
 	/* recheck policy now with rq lock held */
@@ -5797,14 +5807,12 @@ recheck:
 	 * of a SCHED_DEADLINE task) we need to check if enough bandwidth
 	 * is available.
 	 */
-// XXX ISS the following test fails upon schedtool
-// need to check the cause
-//	if ((dl_policy(policy) || dl_task(p)) &&
-//	    dl_overflow(p, policy, param_ex)) {
-//		__task_rq_unlock(rq);
-//		raw_spin_unlock_irqrestore(&p->pi_lock, flags);
-//		return -EBUSY;
-//	}
+	if ((dl_policy(policy) || dl_task(p)) &&
+	    dl_overflow(p, policy, param)) {
+		__task_rq_unlock(rq);
+		raw_spin_unlock_irqrestore(&p->pi_lock, flags);
+		return -EBUSY;
+	}
 
 	on_rq = p->on_rq;
 	running = task_current(rq, p);
@@ -6188,6 +6196,7 @@ long sched_setaffinity(pid_t pid, const struct cpumask *in_mask)
 	 * tasks allowed to run on all the CPUs in the task's
 	 * root_domain.
 	 */
+#ifdef CONFIG_SMP
 	if (task_has_dl_policy(p)) {
 		const struct cpumask *span = task_rq(p)->rd->span;
 
@@ -6197,6 +6206,7 @@ long sched_setaffinity(pid_t pid, const struct cpumask *in_mask)
 			goto out_unlock;
 		}
 	}
+#endif
 
 	cpuset_cpus_allowed(p, cpus_allowed);
 	cpumask_and(new_mask, in_mask, cpus_allowed);
@@ -6576,6 +6586,7 @@ SYSCALL_DEFINE1(sched_get_priority_max, int, policy)
 	case SCHED_RR:
 		ret = MAX_USER_RT_PRIO-1;
 		break;
+	case SCHED_DEADLINE:
 	case SCHED_NORMAL:
 	case SCHED_BATCH:
 	case SCHED_IDLE:
@@ -6601,6 +6612,7 @@ SYSCALL_DEFINE1(sched_get_priority_min, int, policy)
 	case SCHED_RR:
 		ret = 1;
 		break;
+	case SCHED_DEADLINE:
 	case SCHED_NORMAL:
 	case SCHED_BATCH:
 	case SCHED_IDLE:
@@ -6967,6 +6979,13 @@ static int __migrate_task(struct task_struct *p, int src_cpu, int dest_cpu)
 		goto done;
 	/* Affinity changed (again). */
 	if (!cpumask_test_cpu(dest_cpu, tsk_cpus_allowed(p)))
+		goto fail;
+
+	/*
+	 * If p is -deadline, proceed only if there is enough
+	 * bandwidth available on dest_cpu
+	 */
+	if (unlikely(dl_task(p)) && !set_task_cpu_dl(p, dest_cpu))
 		goto fail;
 
 	/*
@@ -8840,11 +8859,10 @@ static void init_dl_rq(struct dl_rq *dl_rq, struct rq *rq)
 	dl_rq->dl_nr_migratory = 0;
 	dl_rq->overloaded = 0;
 	dl_rq->pushable_dl_tasks_root = RB_ROOT;
+#else
+	init_dl_bw(&dl_rq->dl_bw);
 #endif
 
-#ifdef CONFIG_DEADLINE_GROUP_SCHED
-	dl_rq->rq = rq;
-#endif
 }
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
@@ -9817,13 +9835,6 @@ static int sched_rt_global_constraints(void)
 	if (sysctl_sched_rt_period <= 0)
 		return -EINVAL;
 
-	/*
-	 * There's always some RT tasks in the root group
-	 * -- migration, kstopmachine etc..
-	 */
-	if (sysctl_sched_rt_runtime == 0)
-		return -EBUSY;
-
 	raw_spin_lock_irqsave(&def_rt_bandwidth.rt_runtime_lock, flags);
 	for_each_possible_cpu(i) {
 		struct rt_rq *rt_rq = &cpu_rq(i)->rt;
@@ -9875,12 +9886,6 @@ unlock:
 
 static bool __sched_dl_global_constraints(u64 runtime, u64 period)
 {
-	/*
-	 * There's always some -deadline tasks in the root group
-	 * -- migration, kstopmachine etc..
-	 */
-	if (runtime == 0)
-		return -EBUSY;
 
 	if (!period || (runtime != RUNTIME_INF && runtime > period))
 		return -EINVAL;
@@ -9912,8 +9917,11 @@ static int sched_dl_global_constraints(void)
 	 * solutions is welcome!
 	 */
 	for_each_possible_cpu(i) {
+#ifdef CONFIG_SMP
 		struct dl_bw *dl_b = &cpu_rq(i)->rd->dl_bw;
-
+#else
+		struct dl_bw *dl_b = &cpu_rq(i)->dl.dl_bw;
+#endif
 		raw_spin_lock(&dl_b->lock);
 		if (new_bw < dl_b->total_bw) {
 			raw_spin_unlock(&dl_b->lock);
@@ -9993,7 +10001,11 @@ int sched_dl_handler(struct ctl_table *table, int write,
 			 * FIXME: As above...
 			 */
 			for_each_possible_cpu(i) {
+#ifdef CONFIG_SMP
 				struct dl_bw *dl_b = &cpu_rq(i)->rd->dl_bw;
+#else
+				struct dl_bw *dl_b = &cpu_rq(i)->dl.dl_bw;
+#endif
 
 				raw_spin_lock(&dl_b->lock);
 				dl_b->bw = new_bw;
