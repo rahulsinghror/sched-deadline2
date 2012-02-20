@@ -90,6 +90,8 @@
 	[RLIMIT_NICE]		= { 0, 0 },				\
 	[RLIMIT_RTPRIO]		= { 0, 0 },				\
 	[RLIMIT_RTTIME]		= {  RLIM_INFINITY,  RLIM_INFINITY },	\
+	[RLIMIT_DLDLINE]	= { ULONG_MAX, ULONG_MAX },		\
+	[RLIMIT_DLRTIME]	= { 0, 0 },				\
 }
 
 #endif	/* __KERNEL__ */

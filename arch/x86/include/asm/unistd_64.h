@@ -686,14 +686,12 @@ __SYSCALL(__NR_getcpu, sys_getcpu)
 __SYSCALL(__NR_process_vm_readv, sys_process_vm_readv)
 #define __NR_process_vm_writev			311
 __SYSCALL(__NR_process_vm_writev, sys_process_vm_writev)
-#define __NR_sched_setscheduler_ex		312
-__SYSCALL(__NR_sched_setscheduler_ex, sys_sched_setscheduler_ex)
-#define __NR_sched_setparam_ex			313
-__SYSCALL(__NR_sched_setparam_ex, sys_sched_setparam_ex)
-#define __NR_sched_getparam_ex			314
-__SYSCALL(__NR_sched_getparam_ex, sys_sched_getparam_ex)
-#define __NR_sched_wait_interval		315
-__SYSCALL(__NR_sched_wait_interval, sys_sched_wait_interv
+#define __NR_sched_setscheduler2		312
+__SYSCALL(__NR_sched_setscheduler2, sys_sched_setscheduler2)
+#define __NR_sched_setparam2			313
+__SYSCALL(__NR_sched_setparam2, sys_sched_setparam2)
+#define __NR_sched_getparam2			314
+__SYSCALL(__NR_sched_getparam2, sys_sched_getparam2)
 
 #ifndef __NO_STUBS
 #define __ARCH_WANT_OLD_READDIR
